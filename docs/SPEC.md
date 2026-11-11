@@ -19,7 +19,9 @@ works for any UnifiedPush app.
   `poll=1` is not called by either client but stays, for application servers; the
   response must end after the cached messages. `since=latest` is only used by those
   application-server polls.
-- SQLite cache of about 12 hours, optional bearer token, high-entropy topics, quotas.
+- A message cache of about 1 hour, kept in memory in v1: a restart drops pending messages
+  (a persistent cache can come later). Per-topic and global limits, an optional bearer token
+  and high-entropy topics.
 
 Nothing else. No attachments, accounts or web UI.
 
