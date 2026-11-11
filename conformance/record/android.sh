@@ -41,8 +41,8 @@ mark "$S/publish"
 publish_text "$T1" "hello from an app server"
 publish_text "$T1" "unicode: caf$(printf '\xc3\xa9') $(printf '\xe2\x9c\x93')"
 publish_file "$T1" "$BIN/small.bin"
-publish_file "$T1" "$BIN/max.bin" PUT
 publish_file "$T1" "$BIN/over.bin"
+publish_file "$T1" "$BIN/max.bin" PUT
 sleep 3
 
 mark "$S/register-second"
@@ -62,9 +62,10 @@ mark "$S/reconnect"
 N=$(rawlines); $ADB shell cmd connectivity airplane-mode disable
 wait_for 120 "$N" 'since=[A-Za-z0-9]'; sleep 5
 
-mark "$S/idle"
-sleep "${IDLE:-50}"
 mark "$S/unregister"
-N=$(rawlines); unreg tok-0002; wait_for 30 "$N" '/\(json\|ws\)'; sleep 3
+N=$(rawlines); unreg tok-0002; wait_for 30 "$N" '/\(json\|ws\)' || true; sleep 3
+# the stream that survives is idle long enough to see a keepalive (ntfy sends one every 45 s)
+mark "$S/idle"
+sleep "${IDLE:-55}"
 mark "$S/end"
 rm -rf "$BIN"

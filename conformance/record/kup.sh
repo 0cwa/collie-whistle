@@ -10,8 +10,8 @@ head -c 20 /dev/urandom > "$BIN/small.bin"; printf '\x00\xff\xfe' >> "$BIN/small
 head -c 4096 /dev/urandom > "$BIN/max.bin"; head -c 4097 /dev/urandom > "$BIN/over.bin"
 cx() { podman exec -i "$CT" bash -s; }
 start_distributor() { cx <<'SH'
-export HOME=/root QT_QPA_PLATFORM=offscreen DBUS_SESSION_BUS_ADDRESS=$(cat /run/kup/addr)
-nohup kunifiedpush-distributor > /run/kup/distributor.log 2>&1 &
+export HOME=/root QT_QPA_PLATFORM=offscreen QT_LOGGING_RULES="org.kde.kunifiedpush*=true" DBUS_SESSION_BUS_ADDRESS=$(cat /run/kup/addr)
+nohup kunifiedpush-distributor >> /run/kup/distributor.log 2>&1 &
 sleep 3
 SH
 }
@@ -26,6 +26,9 @@ pkill -f kunifiedpush-distributor || true; pkill -f connector.py || true; pkill 
 rm -rf \$HOME/.config/KDE \$HOME/.config/*unifiedpush* \$HOME/.local/share/*nifiedpush*
 mkdir -p \$HOME/.config/KDE /run/kup
 printf '[PushProvider]\nType=Ntfy\n\n[Ntfy]\nUrl=$NTFY_URL\n' > \$HOME/.config/KDE/kunifiedpush-distributor.conf
+for n in org.example.kupapp1 org.example.kupapp2; do
+  printf '[D-BUS Service]\nName=%s\nExec=/usr/bin/true\n' \$n > /usr/share/dbus-1/services/\$n.service
+done
 dbus-daemon --session --fork --print-address > /run/kup/addr
 SH
 podman cp "$HERE/connector.py" "$CT":/run/kup/connector.py
@@ -44,8 +47,8 @@ mark "$S/publish"
 publish_text "$T1" "hello from an app server"
 publish_text "$T1" "unicode: caf$(printf '\xc3\xa9') $(printf '\xe2\x9c\x93')"
 publish_file "$T1" "$BIN/small.bin"
-publish_file "$T1" "$BIN/max.bin" PUT
 publish_file "$T1" "$BIN/over.bin"
+publish_file "$T1" "$BIN/max.bin" PUT
 sleep 3
 
 mark "$S/register-second"
@@ -68,10 +71,11 @@ mark "$S/reconnect"
 N=$(rawlines); start_distributor
 wait_for 60 "$N" 'since=[A-Za-z0-9]'; sleep 5
 
-mark "$S/idle"
-sleep "${IDLE:-50}"
 mark "$S/unregister"
-N=$(rawlines); unreg tok-kup-0002; sleep 3
+N=$(rawlines); unreg tok-kup-0002; wait_for 30 "$N" "/sse" || true; sleep 3
+mark "$S/idle"
+sleep "${IDLE:-55}"
 mark "$S/end"
 rm -rf "$BIN"
 echo "--- what the connectors received over D-Bus"; cx <<<'cat /run/kup/connector.log'
+if [ -n "${KEEP_LOG:-}" ]; then podman exec "$CT" cat /run/kup/distributor.log > "$KEEP_LOG"; fi

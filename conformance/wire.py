@@ -154,8 +154,9 @@ class Conn:
             hdr += bytes([0x80 | 127]) + struct.pack(">Q", n)
         self.sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
-    def ws_recv(self):
-        """Next data message as (opcode, payload); answers ping, raises Closed on close."""
+    def ws_recv(self, on_control=None):
+        """Next data message as (opcode, payload); answers ping, raises Closed on close.
+        on_control(opcode, payload) is told about ping (9) and pong (10) frames."""
         msg, op0 = b"", None
         while True:
             b0, b1 = self.read_n(2)
@@ -167,8 +168,11 @@ class Conn:
             data = self.read_n(n)  # server frames are unmasked
             if op == 9:
                 self.ws_send(10, data)
+                if on_control:
+                    on_control(op, data)
             elif op == 10:
-                pass
+                if on_control:
+                    on_control(op, data)
             elif op == 8:
                 try:
                     self.ws_send(8, data[:2])

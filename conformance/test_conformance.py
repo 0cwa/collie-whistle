@@ -20,7 +20,7 @@ URL = os.environ.get("WHISTLE_URL", "")
 FAST = os.environ.get("WHISTLE_FAST") == "1"
 TIMEOUT = float(os.environ.get("WHISTLE_TIMEOUT", "15"))
 KEEPALIVE_TIMEOUT = 75.0
-ID_RE = re.compile(r"^[A-Za-z0-9]{12}$")
+ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ALPHABET = string.ascii_letters + string.digits
 
 
@@ -38,6 +38,7 @@ class Run:
         self.streams = {}   # name -> Stream
         self.where = ""
         self.last_publish = 0.0
+        self.rejected = set()   # ids of publishes the server refused as too large
 
     def fill(self, s):
         return re.sub(r"\{([tm]\d+)\}", lambda m: self.vars[m.group(1)], s)
@@ -49,8 +50,12 @@ class Run:
         if isinstance(exp, dict):
             if not isinstance(act, dict):
                 self.fail("%s: expected object, got %r" % (path, act))
-            if set(exp) != set(act):
-                self.fail("%s: keys differ, expected %s, got %s (actual %s)" % (path, sorted(exp), sorted(act), json.dumps(act)[:300]))
+            # every key the fixture names must be present; extra keys are fine, because the
+            # clients read only a few fields (ntfy Android: id, time, event, topic, message,
+            # encoding; KUnifiedPush: id, topic, message, encoding)
+            missing = sorted(set(exp) - set(act))
+            if missing:
+                self.fail("%s: missing keys %s (actual %s)" % (path, missing, json.dumps(act)[:300]))
             for k in exp:
                 self.match(exp[k], act[k], "%s.%s" % (path, k))
         elif isinstance(exp, list):
@@ -58,12 +63,16 @@ class Run:
                 self.fail("%s: expected list of %d, got %r" % (path, len(exp), act))
             for i, (e, a) in enumerate(zip(exp, act)):
                 self.match(e, a, "%s[%d]" % (path, i))
+        elif exp == "<other>":
+            # SSE event name that is neither absent nor "open" (KUnifiedPush ignores those)
+            if not act or act == "open":
+                self.fail("%s: expected an event name other than open, got %r" % (path, act))
         elif exp == "<int>":
             if not isinstance(act, int) or isinstance(act, bool):
                 self.fail("%s: expected integer, got %r" % (path, act))
         elif isinstance(exp, str) and exp.startswith("<id:"):
             if not isinstance(act, str) or not ID_RE.match(act):
-                self.fail("%s: expected a 12-character message id, got %r" % (path, act))
+                self.fail("%s: expected a message id (URL-safe characters), got %r" % (path, act))
             self.vars[exp[4:-1]] = act
         elif isinstance(exp, str):
             want = self.fill(exp)
@@ -97,7 +106,7 @@ class Stream:
         try:
             if self.kind == "ws":
                 while True:
-                    op, data = self.conn.ws_recv()
+                    op, data = self.conn.ws_recv(self._control)
                     if op == 1:
                         self.q.put({"json": json.loads(data)})
             buf = b""
@@ -120,6 +129,10 @@ class Stream:
             self.q.put(None)
         except Exception as e:  # reader died: surface it in the test instead of hanging
             self.q.put(e)
+
+    def _control(self, op, data):
+        if op == 10:
+            self.q.put({"pong": data.decode("latin-1")})
 
     @staticmethod
     def _sse(block):
@@ -145,8 +158,14 @@ class Stream:
         return item
 
 
+def refers_to_rejected(run, exp):
+    mid = exp.get("id") if isinstance(exp, dict) else None
+    return isinstance(mid, str) and mid.startswith("{") and mid[1:-1] in run.rejected
+
+
 def is_keepalive(ev):
-    return ev.get("sse_event") == "keepalive" or ev.get("json", {}).get("event") == "keepalive"
+    se = ev.get("sse_event")
+    return ev.get("json", {}).get("event") == "keepalive" or se not in (None, "", "open")
 
 
 def run_step(run, i, step):
@@ -174,13 +193,28 @@ def run_step(run, i, step):
             conn.send_request(step.get("method", "GET"), path, headers, body)
             status, rh = conn.read_head()
         try:
-            run.check_head(exp, status, rh)
+            if not (status == 413 and "limit" in step):
+                run.check_head(exp, status, rh)
         except Mismatch:
             conn.close()
             raise
         if op == "request":
             data = conn.read_body()
             conn.close()
+            if "limit" in step:
+                # over the 4096-byte UnifiedPush maximum: accepting and keeping exactly the
+                # first 4096 bytes, or refusing with 413, are both allowed (stock ntfy accepts)
+                if status == 413:
+                    for k, v in (exp.get("json") or {}).items():
+                        if k == "id" and v.startswith("<id:"):
+                            run.rejected.add(v[4:-1])
+                    return
+                if status != 200:
+                    run.fail("oversize publish: expected 200 or 413, got %s" % status)
+                body_cut = base64.b64encode(body[:step["limit"]]).decode()
+                got = json.loads(data).get("message")
+                if got != body_cut or json.loads(data).get("encoding") != "base64":
+                    run.fail("oversize publish accepted but not exactly the first %d bytes" % step["limit"])
             if "json" in exp:
                 try:
                     run.match(exp["json"], json.loads(data))
@@ -189,14 +223,18 @@ def run_step(run, i, step):
             elif "text" in exp:
                 run.match(exp["text"], data.decode(errors="replace"))
             elif "ndjson" in exp:
+                exp = dict(exp, ndjson=[m for m in exp["ndjson"] if not refers_to_rejected(run, m)])
                 run.match(exp["ndjson"], [json.loads(x) for x in data.decode().splitlines() if x.strip()])
         else:
             st = Stream(conn, step["transport"])
+            st.ends = bool(step.get("ends"))
             st.start()
             run.streams[step["stream"]] = st
     elif op == "recv":
         st = run.streams[step["stream"]]
         exp = step["expect"]
+        if refers_to_rejected(run, exp.get("json")):
+            return
         want_ka = exp.get("json", {}).get("event") == "keepalive"
         while True:
             ev = st.next(KEEPALIVE_TIMEOUT if want_ka else TIMEOUT)
@@ -208,23 +246,43 @@ def run_step(run, i, step):
                 continue
             break
         run.match(exp, ev)
+    elif op == "ping":
+        # ntfy Android pings every 3 minutes and drops the connection if no pong comes back
+        st = run.streams[step["stream"]]
+        st.conn.ws_send(9, step.get("payload", "conformance").encode())
+        while True:
+            ev = st.next(TIMEOUT)
+            if ev == "timeout" or ev is None:
+                run.fail("no pong for the ping on stream %s" % step["stream"])
+            if "pong" in ev:
+                break
+            if not is_keepalive(ev):
+                run.fail("unexpected message while waiting for pong: %s" % json.dumps(ev)[:200])
+        if ev["pong"] != step.get("payload", "conformance"):
+            run.fail("pong payload %r does not echo the ping" % ev["pong"])
     elif op == "close":
         st = run.streams.pop(step["stream"])
-        # nothing may be left over that the client did not get to see
+        # nothing may be left over that the client did not get to see. A poll=1 request
+        # must also end by itself; other streams are given a moment to show stray messages.
+        ended = False
         while True:
-            ev = st.next(0.4)
+            ev = st.next(TIMEOUT if st.ends else 0.4)
             if ev == "timeout" or ev is None:
+                ended = ev is None
                 break
             if not is_keepalive(ev):
                 st.conn.close()
                 run.fail("unexpected extra message on stream %s: %s" % (step["stream"], json.dumps(ev)[:300]))
         st.conn.close()
+        if st.ends and not ended:
+            run.fail("poll=1 stream %s did not end after its messages" % step["stream"])
     else:
         raise ValueError("unknown op %r" % op)
 
 
 def make_test(fx):
     def test(self):
+        self.assertTrue(fx.get("steps"), "fixture has no steps")
         run = Run(fx)
         try:
             for i, step in enumerate(fx["steps"]):

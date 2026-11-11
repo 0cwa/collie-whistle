@@ -124,7 +124,9 @@ class Norm:
             if k == "topic":
                 self.topic_list(v)
                 out[k] = self.text(v)
-            elif k in ("id", "sequence_id"):
+            elif k == "sequence_id":
+                continue  # ntfy Android falls back to id when it is absent; no client needs it
+            elif k == "id":
                 out[k] = self.id_ref(v)
             elif k in ("time", "expires"):
                 out[k] = "<int>"
@@ -162,7 +164,9 @@ def parse_stream(f, kind):
                 break
             block, buf = buf[:m.start()], buf[m.end():]
             for ev in sse_events(block + b"\n\n"):
-                e = {"sse_event": ev["sse_event"]}
+                # KUnifiedPush: no event line = message, "open" = connected, anything else ignored
+                se = ev["sse_event"]
+                e = {"sse_event": se if se in (None, "open") else "<other>"}
                 if ev["data"] is not None:
                     e["json"] = json.loads(ev["data"])
                 out.append((t, e))
@@ -194,6 +198,8 @@ def build(scenario, flows, markers, source, client_label):
         if rh:
             step["headers"] = rh
         is_stream = path.endswith(STREAM_SUFFIXES) and resp.get("status") in (200, 101)
+        if len(body) > 4096:
+            step["limit"] = 4096  # UnifiedPush maximum; see the runner for what is allowed
         if body:
             step["body_b64"] = base64.b64encode(body).decode()
             try:
@@ -216,6 +222,8 @@ def build(scenario, flows, markers, source, client_label):
             if kind == "ws":
                 expect.pop("headers", None)
             step["expect"] = expect
+            if "poll=1" in req["path"]:
+                step["ends"] = True  # a poll answers and then the server ends the response
             items.append((req["t"], 0, step))
             for t, e in parse_stream(f, kind):
                 js = e.get("json")
@@ -258,11 +266,12 @@ def build(scenario, flows, markers, source, client_label):
     for real, name in sorted(norm.topics.items(), key=lambda kv: -len(kv[0])):
         raw = raw.replace(real, "{%s}" % name)
     steps = json.loads(raw)
+    if not steps:
+        sys.exit("scenario %s has no steps" % scenario)
     return {
         "scenario": scenario,
         "source": source,
         "client": client_label,
-        "slow": bool(t_idle),
         "topics": len(norm.topics),
         "steps": steps,
     }
