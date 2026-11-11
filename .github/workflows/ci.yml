@@ -1,0 +1,19 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: cargo test --locked
+      - name: Conformance suite against the built binary
+        run: |
+          WHISTLE_LISTEN=127.0.0.1:8080 target/release/collie-whistle &
+          sleep 1
+          conformance/run.sh http://127.0.0.1:8080
