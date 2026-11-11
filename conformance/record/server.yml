@@ -1,0 +1,10 @@
+# ntfy server config used for recording and for running the suite against stock ntfy.
+# Run from a scratch directory:  ntfy serve -c server.yml
+listen-http: "127.0.0.1:12586"
+base-url: "http://10.0.2.2:12587"   # what the emulator sees: the recording proxy on the host
+cache-file: "ntfy-cache.db"
+cache-duration: "12h"
+# stock limits answer 429 after about 60 requests, which one suite run nearly reaches
+visitor-request-limit-burst: 1000
+visitor-request-limit-replenish: "100ms"
+visitor-message-daily-limit: 0

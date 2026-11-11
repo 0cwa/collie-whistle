@@ -1,0 +1,38 @@
+{
+ "scenario": "ws-ping",
+ "source": "reference",
+ "client": "hand-written: ntfy Android pings /ws every 3 minutes (HttpUtil.kt pingInterval) and needs the pong; stock ntfy 2.37.2 itself sends a ws ping frame every 45 s and no JSON keepalive on /ws (observed with a raw probe)",
+ "topics": 1,
+ "steps": [
+  {
+   "op": "open",
+   "path": "/{t1}/ws",
+   "stream": "s1",
+   "transport": "ws",
+   "expect": {
+    "status": 101
+   }
+  },
+  {
+   "op": "recv",
+   "stream": "s1",
+   "expect": {
+    "json": {
+     "id": "<id:m1>",
+     "time": "<int>",
+     "event": "open",
+     "topic": "{t1}"
+    }
+   }
+  },
+  {
+   "op": "ping",
+   "stream": "s1",
+   "payload": "conformance"
+  },
+  {
+   "op": "close",
+   "stream": "s1"
+  }
+ ]
+}
