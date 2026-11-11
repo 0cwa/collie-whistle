@@ -18,6 +18,9 @@ async fn main() {
     let listen: String = env("WHISTLE_LISTEN", "127.0.0.1:8080".to_string());
     let config = Config {
         max_messages: env("WHISTLE_MAX_MESSAGES", d.max_messages),
+        max_per_topic: env("WHISTLE_MAX_PER_TOPIC", d.max_per_topic),
+        publish_rate: env("WHISTLE_PUBLISH_RATE", d.publish_rate),
+        max_connections: env("WHISTLE_MAX_CONNECTIONS", d.max_connections),
         cache_duration: Duration::from_secs(env(
             "WHISTLE_CACHE_SECONDS",
             d.cache_duration.as_secs(),
@@ -25,6 +28,7 @@ async fn main() {
         keepalive: Duration::from_secs(
             env("WHISTLE_KEEPALIVE_SECONDS", d.keepalive.as_secs()).max(1),
         ),
+        ..d
     };
     let listener = tokio::net::TcpListener::bind(&listen)
         .await

@@ -27,32 +27,54 @@ use axum::routing::{any, get};
 use axum::{Json, Router};
 use base64::Engine;
 use futures_util::StreamExt;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::time::{interval_at, Instant, Interval, MissedTickBehavior};
+use tokio::sync::Semaphore;
+use tokio::time::{interval_at, sleep_until, timeout, Instant, Interval, MissedTickBehavior};
 
+use store::{Limits, RateLimited, Subscription};
 pub use store::{Message, Since, Store};
 
 /// The largest body a UnifiedPush message may have.
 pub const MAX_BODY: usize = 4096;
 
+/// How long a WebSocket write may take before the client is dropped.
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Messages kept in total; the oldest go first.
     pub max_messages: usize,
+    /// Messages kept per topic; a topic that goes over loses its own oldest message.
+    pub max_per_topic: usize,
     /// How long a message stays available for `since=`.
     pub cache_duration: Duration,
+    /// Publishes accepted per second over all topics, 0 for no limit.
+    pub publish_rate: u32,
     /// Gap between keepalive events and WebSocket pings on idle subscriptions.
     pub keepalive: Duration,
+    /// Open connections at once; further ones wait to be accepted.
+    pub max_connections: usize,
+    /// Time a client gets to send a complete request header.
+    pub header_timeout: Duration,
+    /// Time a publisher gets to send its body.
+    pub body_timeout: Duration,
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
             max_messages: 10_000,
-            cache_duration: Duration::from_secs(12 * 3600),
+            max_per_topic: 100,
+            cache_duration: Duration::from_secs(3600),
+            publish_rate: 100,
             keepalive: Duration::from_secs(45),
+            max_connections: 1024,
+            header_timeout: Duration::from_secs(10),
+            body_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -61,14 +83,17 @@ impl Default for Config {
 struct App {
     store: Arc<Store>,
     keepalive: Duration,
+    body_timeout: Duration,
 }
 
 /// Builds the router. Must be called inside a tokio runtime (it starts the cache expiry task).
 pub fn router(config: Config) -> Router {
-    let store = Arc::new(Store::new(
-        config.max_messages,
-        config.cache_duration.as_secs(),
-    ));
+    let store = Arc::new(Store::new(Limits {
+        max_messages: config.max_messages,
+        max_per_topic: config.max_per_topic,
+        max_age_secs: config.cache_duration.as_secs(),
+        publish_rate: config.publish_rate,
+    }));
     let weak = Arc::downgrade(&store);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -92,12 +117,42 @@ pub fn router(config: Config) -> Router {
         .with_state(App {
             store,
             keepalive: config.keepalive,
+            body_timeout: config.body_timeout,
         })
 }
 
-/// Serves on `listener` until the future is dropped or the listener fails.
+/// Serves on `listener` until the future is dropped or accepting fails for good. Connections
+/// are capped at `max_connections`, and one that does not send its request header within
+/// `header_timeout` is closed.
 pub async fn serve(listener: tokio::net::TcpListener, config: Config) -> std::io::Result<()> {
-    axum::serve(listener, router(config)).await
+    let permits = Arc::new(Semaphore::new(config.max_connections.max(1)));
+    let header_timeout = config.header_timeout;
+    let app = router(config);
+    loop {
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                // out of file descriptors or a connection reset before accept: try again shortly
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let service = TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let _ = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_timeout)
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+            drop(permit);
+        });
+    }
 }
 
 // ---- errors
@@ -159,21 +214,29 @@ async fn topic_root(
 
 async fn publish(app: &App, topic: &str, up: bool, body: Body) -> Response {
     // Like stock ntfy, keep the first 4096 bytes of a longer body and drop the rest.
-    let mut bytes = Vec::new();
-    let mut data = body.into_data_stream();
-    while bytes.len() < MAX_BODY {
-        match data.next().await {
-            Some(Ok(chunk)) => bytes.extend_from_slice(&chunk),
-            Some(Err(_)) => {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    40001,
-                    "cannot read the request body",
-                )
+    let read = async {
+        let mut bytes = Vec::new();
+        let mut data = body.into_data_stream();
+        while bytes.len() < MAX_BODY {
+            match data.next().await {
+                Some(Ok(chunk)) => bytes.extend_from_slice(&chunk),
+                Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
+                None => break,
             }
-            None => break,
         }
-    }
+        Ok(bytes)
+    };
+    let mut bytes = match timeout(app.body_timeout, read).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                40001,
+                "cannot read the request body",
+            )
+        }
+        Err(_) => return error(StatusCode::REQUEST_TIMEOUT, 40801, "request body too slow"),
+    };
     bytes.truncate(MAX_BODY);
     let (message, encoding) = match String::from_utf8(bytes) {
         Ok(s) if s.is_empty() => ("triggered".to_string(), None),
@@ -185,8 +248,10 @@ async fn publish(app: &App, topic: &str, up: bool, body: Body) -> Response {
             Some("base64"),
         ),
     };
-    let m = app.store.publish(topic, message, encoding);
-    Json(&*m).into_response()
+    match app.store.publish(topic, message, encoding) {
+        Ok(m) => Json(&*m).into_response(),
+        Err(RateLimited) => error(StatusCode::TOO_MANY_REQUESTS, 42901, "too many messages"),
+    }
 }
 
 // ---- subscribe
@@ -199,12 +264,11 @@ enum Event {
 
 /// One subscriber: an open event, the cached backlog, then live messages and keepalives.
 struct Sub {
-    topics: HashSet<String>,
     label: String, // the topic list as the client wrote it, echoed in open and keepalive events
     opened: bool,
     poll: bool,
     backlog: std::vec::IntoIter<Arc<Message>>,
-    rx: broadcast::Receiver<Arc<Message>>,
+    rxs: Vec<broadcast::Receiver<Arc<Message>>>,
     ticker: Interval,
 }
 
@@ -212,18 +276,17 @@ impl Sub {
     fn new(app: &App, label: String, q: &Params) -> Result<Sub, Response> {
         let topics = parse_topics(&label)?;
         let poll = flag(&q.poll);
-        let (backlog, rx) = app
+        let Subscription { backlog, rxs } = app
             .store
             .subscribe(&topics, &Since::parse(q.since.as_deref(), poll));
         let mut ticker = interval_at(Instant::now() + app.keepalive, app.keepalive);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Ok(Sub {
-            topics,
             label,
             opened: poll,
             poll,
             backlog: backlog.into_iter(),
-            rx,
+            rxs,
             ticker,
         })
     }
@@ -241,15 +304,12 @@ impl Sub {
         if self.poll {
             return None;
         }
-        loop {
-            tokio::select! {
-                r = self.rx.recv() => match r {
-                    Ok(m) if self.topics.contains(&m.topic) => return Some(Event::Message(m)),
-                    Ok(_) => {}
-                    Err(RecvError::Lagged(_) | RecvError::Closed) => return None,
-                },
-                _ = self.ticker.tick() => return Some(Event::Keepalive),
-            }
+        tokio::select! {
+            r = recv_any(&mut self.rxs) => match r {
+                Ok(m) => Some(Event::Message(m)),
+                Err(RecvError::Lagged(_) | RecvError::Closed) => None,
+            },
+            _ = self.ticker.tick() => Some(Event::Keepalive),
         }
     }
 
@@ -264,6 +324,18 @@ impl Sub {
             Event::Message(m) => serde_json::to_string(&**m).unwrap_or_default(),
         }
     }
+}
+
+/// The next message from any of the topic channels. Cancel safe.
+async fn recv_any(
+    rxs: &mut [broadcast::Receiver<Arc<Message>>],
+) -> Result<Arc<Message>, RecvError> {
+    if let [rx] = rxs {
+        return rx.recv().await;
+    }
+    futures_util::future::select_all(rxs.iter_mut().map(|r| Box::pin(r.recv())))
+        .await
+        .0
 }
 
 fn stream_response(content_type: &'static str, body: Body) -> Response {
@@ -325,14 +397,20 @@ async fn sub_ws(
     upgrade: WebSocketUpgrade,
 ) -> Response {
     match Sub::new(&app, topics, &q) {
-        Ok(sub) => upgrade.on_upgrade(move |sock| run_ws(sock, sub)),
+        Ok(sub) => upgrade
+            .max_message_size(MAX_BODY)
+            .max_frame_size(MAX_BODY)
+            .on_upgrade(move |sock| run_ws(sock, sub, app.keepalive)),
         Err(e) => e,
     }
 }
 
 /// Stock ntfy sends a WebSocket ping every keepalive interval instead of a JSON keepalive
-/// event, and ntfy Android pings the server in turn, so pings are answered with pongs.
-async fn run_ws(mut sock: WebSocket, mut sub: Sub) {
+/// event, and ntfy Android pings the server in turn, so pings are answered with pongs. A client
+/// that sends no frame (pongs count) for two keepalive intervals, or cannot take a message for
+/// 30 s, is dropped.
+async fn run_ws(mut sock: WebSocket, mut sub: Sub, keepalive: Duration) {
+    let mut last_frame = Instant::now();
     loop {
         tokio::select! {
             ev = sub.next() => {
@@ -341,19 +419,23 @@ async fn run_ws(mut sock: WebSocket, mut sub: Sub) {
                     Some(Event::Keepalive) => WsMessage::Ping(Bytes::new()),
                     Some(ev) => WsMessage::Text(sub.json(&ev).into()),
                 };
-                if sock.send(out).await.is_err() {
+                if !matches!(timeout(WS_SEND_TIMEOUT, sock.send(out)).await, Ok(Ok(()))) {
                     break;
                 }
             }
-            frame = sock.recv() => match frame {
-                Some(Ok(WsMessage::Ping(p))) => {
-                    if sock.send(WsMessage::Pong(p)).await.is_err() {
-                        break;
+            frame = sock.recv() => {
+                last_frame = Instant::now();
+                match frame {
+                    Some(Ok(WsMessage::Ping(p))) => {
+                        if !matches!(timeout(WS_SEND_TIMEOUT, sock.send(WsMessage::Pong(p))).await, Ok(Ok(()))) {
+                            break;
+                        }
                     }
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
                 }
-                Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
-                Some(Ok(_)) => {}
-            },
+            }
+            _ = sleep_until(last_frame + 2 * keepalive) => break,
         }
     }
 }

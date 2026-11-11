@@ -95,6 +95,8 @@ dependencies = [
  "axum",
  "base64",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "rand",
  "serde",
  "serde_json",
