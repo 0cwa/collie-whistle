@@ -19,7 +19,14 @@ async fn main() {
     let config = Config {
         max_messages: env("WHISTLE_MAX_MESSAGES", d.max_messages),
         max_per_topic: env("WHISTLE_MAX_PER_TOPIC", d.max_per_topic),
+        max_live_topics: env("WHISTLE_MAX_LIVE_TOPICS", d.max_live_topics),
+        max_subscribers_per_topic: env(
+            "WHISTLE_MAX_SUBSCRIBERS_PER_TOPIC",
+            d.max_subscribers_per_topic,
+        ),
         publish_rate: env("WHISTLE_PUBLISH_RATE", d.publish_rate),
+        topic_publish_rate: env("WHISTLE_TOPIC_PUBLISH_RATE", d.topic_publish_rate),
+        subscribe_rate: env("WHISTLE_SUBSCRIBE_RATE", d.subscribe_rate),
         max_connections: env("WHISTLE_MAX_CONNECTIONS", d.max_connections),
         cache_duration: Duration::from_secs(env(
             "WHISTLE_CACHE_SECONDS",
@@ -44,6 +51,29 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        _ = tokio::signal::ctrl_c() => {}
+        _ = shutdown_signal() => {}
+    }
+}
+
+/// Resolves on Ctrl-C or, on Unix, SIGTERM, so the process can exit cleanly under a supervisor.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

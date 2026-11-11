@@ -20,6 +20,8 @@ fn fast() -> Config {
         header_timeout: Duration::from_millis(500),
         body_timeout: Duration::from_millis(500),
         publish_rate: 0,
+        topic_publish_rate: 0,
+        subscribe_rate: 0,
         ..Config::default()
     }
 }

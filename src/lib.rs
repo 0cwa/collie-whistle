@@ -11,9 +11,10 @@
 // The error side of these helpers is a ready-made HTTP response; it is only built on bad requests.
 #![allow(clippy::result_large_err)]
 
+mod io;
 mod store;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,11 +32,12 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::sync::Semaphore;
+use tokio::sync::broadcast::{self, error::RecvError, error::TryRecvError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval_at, sleep_until, timeout, Instant, Interval, MissedTickBehavior};
 
-use store::{Limits, RateLimited, Subscription};
+use io::WriteTimeout;
+use store::{Limits, Live, RateLimited, SubscribeError, Subscription};
 pub use store::{Message, Since, Store};
 
 /// The largest body a UnifiedPush message may have.
@@ -50,18 +52,29 @@ pub struct Config {
     pub max_messages: usize,
     /// Messages kept per topic; a topic that goes over loses its own oldest message.
     pub max_per_topic: usize,
+    /// Topics that may have live subscribers at once; more are refused with 429.
+    pub max_live_topics: usize,
+    /// Live subscribers of one topic; more are refused with 429.
+    pub max_subscribers_per_topic: usize,
     /// How long a message stays available for `since=`.
     pub cache_duration: Duration,
-    /// Publishes accepted per second over all topics, 0 for no limit.
+    /// Publishes accepted per second over all topics, 0 for no limit. A high ceiling.
     pub publish_rate: u32,
+    /// Publishes accepted per second to one topic, 0 for no limit.
+    pub topic_publish_rate: u32,
+    /// Subscribe requests accepted per second, 0 for no limit.
+    pub subscribe_rate: u32,
     /// Gap between keepalive events and WebSocket pings on idle subscriptions.
     pub keepalive: Duration,
-    /// Open connections at once; further ones wait to be accepted.
+    /// Open connections at once; further ones wait to be accepted. Three quarters of them may
+    /// be live subscriptions, so short requests (publish, health) always have room.
     pub max_connections: usize,
     /// Time a client gets to send a complete request header.
     pub header_timeout: Duration,
     /// Time a publisher gets to send its body.
     pub body_timeout: Duration,
+    /// Time a client gets to accept data the server is sending before the connection is closed.
+    pub write_timeout: Duration,
 }
 
 impl Default for Config {
@@ -69,12 +82,17 @@ impl Default for Config {
         Config {
             max_messages: 10_000,
             max_per_topic: 100,
+            max_live_topics: 4096,
+            max_subscribers_per_topic: 16,
             cache_duration: Duration::from_secs(3600),
             publish_rate: 100,
+            topic_publish_rate: 5,
+            subscribe_rate: 100,
             keepalive: Duration::from_secs(45),
-            max_connections: 1024,
+            max_connections: 512,
             header_timeout: Duration::from_secs(10),
             body_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -84,15 +102,21 @@ struct App {
     store: Arc<Store>,
     keepalive: Duration,
     body_timeout: Duration,
+    /// Permits for live subscriptions: a share of the connection cap, so that publishers and
+    /// health checks always find room.
+    subs: Arc<Semaphore>,
 }
 
-/// Builds the router. Must be called inside a tokio runtime (it starts the cache expiry task).
-pub fn router(config: Config) -> Router {
+fn make_app(config: &Config) -> App {
     let store = Arc::new(Store::new(Limits {
         max_messages: config.max_messages,
         max_per_topic: config.max_per_topic,
         max_age_secs: config.cache_duration.as_secs(),
         publish_rate: config.publish_rate,
+        topic_publish_rate: config.topic_publish_rate,
+        subscribe_rate: config.subscribe_rate,
+        max_live_topics: config.max_live_topics,
+        max_subscribers_per_topic: config.max_subscribers_per_topic,
     }));
     let weak = Arc::downgrade(&store);
     tokio::spawn(async move {
@@ -105,6 +129,16 @@ pub fn router(config: Config) -> Router {
             }
         }
     });
+    let connections = config.max_connections.max(1);
+    App {
+        store,
+        keepalive: config.keepalive,
+        body_timeout: config.body_timeout,
+        subs: Arc::new(Semaphore::new((connections * 3 / 4).max(1))),
+    }
+}
+
+fn routes(app: App) -> Router {
     Router::new()
         .route(
             "/v1/health",
@@ -114,20 +148,23 @@ pub fn router(config: Config) -> Router {
         .route("/{topics}/json", get(sub_json))
         .route("/{topics}/sse", get(sub_sse))
         .route("/{topics}/ws", get(sub_ws))
-        .with_state(App {
-            store,
-            keepalive: config.keepalive,
-            body_timeout: config.body_timeout,
-        })
+        .with_state(app)
 }
 
-/// Serves on `listener` until the future is dropped or accepting fails for good. Connections
-/// are capped at `max_connections`, and one that does not send its request header within
-/// `header_timeout` is closed.
+/// Builds the router. Must be called inside a tokio runtime (it starts the cache expiry task).
+/// Connection limits and timeouts belong to [`serve`]; the router has none of its own.
+pub fn router(config: Config) -> Router {
+    routes(make_app(&config))
+}
+
+/// Serves on `listener` until the future is dropped. Connections are capped at
+/// `max_connections`; one that does not send its request header within `header_timeout`, or
+/// does not accept data for `write_timeout`, is closed.
 pub async fn serve(listener: tokio::net::TcpListener, config: Config) -> std::io::Result<()> {
     let permits = Arc::new(Semaphore::new(config.max_connections.max(1)));
-    let header_timeout = config.header_timeout;
+    let (header_timeout, write_timeout) = (config.header_timeout, config.write_timeout);
     let app = router(config);
+    let mut last_error: Option<std::io::ErrorKind> = None;
     loop {
         let permit = permits
             .clone()
@@ -135,9 +172,17 @@ pub async fn serve(listener: tokio::net::TcpListener, config: Config) -> std::io
             .await
             .expect("semaphore is never closed");
         let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
-            Err(_) => {
-                // out of file descriptors or a connection reset before accept: try again shortly
+            Ok((stream, _)) => {
+                last_error = None;
+                stream
+            }
+            Err(e) => {
+                // out of file descriptors, or a connection reset before accept: log each
+                // distinct error once, then try again shortly
+                if last_error != Some(e.kind()) {
+                    eprintln!("collie-whistle: accept failed: {e}");
+                    last_error = Some(e.kind());
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -147,7 +192,10 @@ pub async fn serve(listener: tokio::net::TcpListener, config: Config) -> std::io
             let _ = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(header_timeout)
-                .serve_connection(TokioIo::new(stream), service)
+                .serve_connection(
+                    TokioIo::new(WriteTimeout::new(stream, write_timeout)),
+                    service,
+                )
                 .with_upgrades()
                 .await;
             drop(permit);
@@ -266,28 +314,50 @@ enum Event {
 struct Sub {
     label: String, // the topic list as the client wrote it, echoed in open and keepalive events
     opened: bool,
-    poll: bool,
     backlog: std::vec::IntoIter<Arc<Message>>,
-    rxs: Vec<broadcast::Receiver<Arc<Message>>>,
+    /// Live messages already taken from the channels, in publish order.
+    queue: VecDeque<Arc<Message>>,
+    /// None for a poll, which ends after the backlog.
+    live: Option<Live>,
     ticker: Interval,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+fn refused(msg: &str, code: u32) -> Response {
+    error(StatusCode::TOO_MANY_REQUESTS, code, msg)
 }
 
 impl Sub {
     fn new(app: &App, label: String, q: &Params) -> Result<Sub, Response> {
         let topics = parse_topics(&label)?;
         let poll = flag(&q.poll);
-        let Subscription { backlog, rxs } = app
-            .store
-            .subscribe(&topics, &Since::parse(q.since.as_deref(), poll));
+        let permit = if poll {
+            None
+        } else {
+            let p = app.subs.clone().try_acquire_owned();
+            Some(p.map_err(|_| refused("too many subscriptions", 42903))?)
+        };
+        let since = Since::parse(q.since.as_deref(), poll);
+        let Subscription { backlog, live } =
+            app.store
+                .subscribe(&topics, &since, !poll)
+                .map_err(|e| match e {
+                    SubscribeError::RateLimited => refused("too many requests", 42902),
+                    SubscribeError::TooManyTopics => refused("too many subscribed topics", 42904),
+                    SubscribeError::TooManySubscribers => {
+                        refused("too many subscribers for a topic", 42905)
+                    }
+                })?;
         let mut ticker = interval_at(Instant::now() + app.keepalive, app.keepalive);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Ok(Sub {
             label,
             opened: poll,
-            poll,
             backlog: backlog.into_iter(),
-            rxs,
+            queue: VecDeque::new(),
+            live,
             ticker,
+            _permit: permit,
         })
     }
 
@@ -298,16 +368,28 @@ impl Sub {
             self.opened = true;
             return Some(Event::Open);
         }
-        if let Some(m) = self.backlog.next() {
+        if let Some(m) = self.backlog.next().or_else(|| self.queue.pop_front()) {
             return Some(Event::Message(m));
         }
-        if self.poll {
-            return None;
-        }
+        let live = self.live.as_mut()?;
         tokio::select! {
-            r = recv_any(&mut self.rxs) => match r {
-                Ok(m) => Some(Event::Message(m)),
-                Err(RecvError::Lagged(_) | RecvError::Closed) => None,
+            r = recv_any(&mut live.rxs) => {
+                let mut batch = vec![r.ok()?];
+                // The channels are per topic, so a later message of one topic can wake us before
+                // an earlier one of another: take everything that is ready and deliver by
+                // publish order. KUnifiedPush keeps one last-message id for all its topics.
+                for rx in live.rxs.iter_mut() {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(m) => batch.push(m),
+                            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                            Err(TryRecvError::Lagged(_)) => return None,
+                        }
+                    }
+                }
+                batch.sort_by_key(|m| m.seq());
+                self.queue.extend(batch);
+                self.queue.pop_front().map(Event::Message)
             },
             _ = self.ticker.tick() => Some(Event::Keepalive),
         }
@@ -437,5 +519,106 @@ async fn run_ws(mut sock: WebSocket, mut sub: Sub, keepalive: Duration) {
             }
             _ = sleep_until(last_frame + 2 * keepalive) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(config: Config) -> App {
+        make_app(&Config {
+            publish_rate: 0,
+            topic_publish_rate: 0,
+            subscribe_rate: 0,
+            ..config
+        })
+    }
+
+    fn params(poll: bool) -> Params {
+        Params {
+            up: None,
+            since: None,
+            poll: poll.then(|| "1".to_string()),
+        }
+    }
+
+    async fn text(sub: &mut Sub) -> String {
+        match sub.next().await {
+            Some(Event::Message(m)) => m.message.clone(),
+            _ => panic!("expected a message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_of_several_topics_arrive_in_publish_order() {
+        let app = app(Config::default());
+        let mut sub = Sub::new(&app, "a,b".into(), &params(false)).ok().unwrap();
+        assert!(matches!(sub.next().await, Some(Event::Open)));
+        // b first, then a: the channel of a is polled first, but b came earlier
+        app.store.publish("b", "1".into(), None).unwrap();
+        app.store.publish("a", "2".into(), None).unwrap();
+        assert_eq!(
+            (text(&mut sub).await, text(&mut sub).await),
+            ("1".into(), "2".into())
+        );
+        for i in 0..50 {
+            let topic = if i % 3 == 0 { "a" } else { "b" };
+            app.store.publish(topic, i.to_string(), None).unwrap();
+        }
+        for i in 0..50 {
+            assert_eq!(text(&mut sub).await, i.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_polls_and_subscribes_keeps_memory_bounded() {
+        let app = app(Config {
+            max_live_topics: 100,
+            ..Config::default()
+        });
+        let list = |round: usize| {
+            (0..50)
+                .map(|i| format!("t{round}x{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for round in 0..1600 {
+            assert!(Sub::new(&app, list(round), &params(true)).is_ok());
+        }
+        assert_eq!(app.store.topic_count(), 0);
+        let mut held = Vec::new();
+        for round in 0..1600 {
+            if let Ok(sub) = Sub::new(&app, list(round), &params(false)) {
+                held.push(sub);
+            }
+            assert!(app.store.topic_count() <= 100);
+        }
+        assert_eq!(held.len(), 2);
+        drop(held);
+        assert_eq!(app.store.topic_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_subscriptions_leave_room_for_short_requests() {
+        let app = app(Config {
+            max_connections: 4,
+            ..Config::default()
+        }); // 3 subscriptions
+        let held: Vec<_> = (0..3)
+            .map(|i| {
+                Sub::new(&app, format!("t{i}"), &params(false))
+                    .ok()
+                    .unwrap()
+            })
+            .collect();
+        let fourth = Sub::new(&app, "t9".into(), &params(false));
+        assert_eq!(
+            fourth.err().map(|r| r.status()),
+            Some(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert!(Sub::new(&app, "t9".into(), &params(true)).is_ok()); // polls are short requests
+        drop(held);
+        assert!(Sub::new(&app, "t9".into(), &params(false)).is_ok());
     }
 }
