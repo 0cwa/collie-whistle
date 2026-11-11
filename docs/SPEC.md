@@ -15,8 +15,10 @@ works for any UnifiedPush app.
 - `POST`/`PUT /{topic}?up=1`, 4096-byte limit, binary bodies preserved (as base64, see below).
 - `GET /{topic}?up=1` discovery. Application servers call it, the two distributors do not.
 - Subscribe over `/json` (ntfy Android, default), `/ws` (ntfy Android, optional) and `/sse`
-  (KUnifiedPush) with `since=none|all|<id>`, multiple topics, `open` and keepalive events.
-  `poll=1` is not called by either client but stays, for application servers.
+  (KUnifiedPush) with `since=none|all|latest|<id>`, multiple topics, `open` and keepalive events.
+  `poll=1` is not called by either client but stays, for application servers; the
+  response must end after the cached messages. `since=latest` is only used by those
+  application-server polls.
 - SQLite cache of about 12 hours, optional bearer token, high-entropy topics, quotas.
 
 Nothing else. No attachments, accounts or web UI.
@@ -46,9 +48,20 @@ Recorded 2026-11-11, details and re-record commands in [CONFORMANCE.md](CONFORMA
   connection with a longer topic list when a second app registers.
 - Publishing with `?up=1` stores a non-UTF-8 body as base64 and adds `"encoding":"base64"`;
   UTF-8 text is stored as is. Stock ntfy without `up=1` refuses binary bodies (400).
-- A body over 4096 bytes is accepted with 200 and silently cut to the first 4096. The
-  fixtures pin that.
-- Stock ntfy sends a keepalive every 45 seconds on all three transports.
+- A body over 4096 bytes: stock ntfy accepts it with 200 and silently cuts it to the first
+  4096 bytes. The suite allows either that (exactly the first 4096 bytes delivered) or
+  413. Whistle may do either; no client depends on which.
+- Keepalives: `/json` and `/sse` get a `keepalive` event every 45 seconds (ntfy Android
+  times a `/json` read out after 77 s of silence). On `/ws` stock ntfy sends a WebSocket
+  ping frame every 45 s and no JSON keepalive; ntfy Android itself pings every 3 minutes,
+  so the server must answer pings with a pong.
+- KUnifiedPush keeps one `LastMessageId` for all its topics. After an app unregisters,
+  it reconnects with `since=<id of a message on the removed topic>`. A provider must
+  accept a `since` id that belongs to another topic (stock ntfy looks the id up globally).
+- Fields the clients read: ntfy Android `id`, `time`, `event`, `topic`, `message`,
+  `encoding` (`sequence_id` defaults to `id`); KUnifiedPush `id`, `topic`, `message`,
+  `encoding` and the SSE event name (absent = message, `open` = connected, other names
+  ignored). Extra JSON fields are allowed; the suite does not require `sequence_id`.
 - Stock ntfy orders messages by whole seconds: `since=<id>` can return that message again
   when the reconnect lands in the same second. The suite spaces its steps to avoid it;
   Whistle may be stricter.
@@ -57,9 +70,18 @@ Recorded 2026-11-11, details and re-record commands in [CONFORMANCE.md](CONFORMA
 
 ## To prove
 
-- The exact calls those two clients make. Scope above is a best estimate until then.
-- Binary payloads arrive intact through both `/json` and `/ws`.
-- Long-lived connections survive idle periods and reconnect with `since=` without loss.
+Answered by the recording (see above and CONFORMANCE.md):
+
+- The exact calls the two clients make: recorded, over `/json`, `/ws` and `/sse`.
+- Binary payloads arrive intact through `/json`, `/ws` and `/sse`: the suite publishes
+  non-UTF-8 bodies of up to 4096 bytes and checks the base64 on every transport, and
+  KUnifiedPush delivered the exact bytes to its connector.
+- Long-lived connections survive idle periods and reconnect with `since=` without loss:
+  the suite idles about a minute on `/json` and `/sse`, checks the ws pong, and checks
+  that messages sent while a client was offline arrive after `since=`.
+
+Still open for Whistle itself: the same fixtures must pass against the Whistle binary,
+and a connection that stays open for hours is not tested here.
 
 ## To decide
 
