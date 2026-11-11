@@ -4,3 +4,5 @@ A small self-hosted UnifiedPush server, compatible with ntfy clients. Part of th
 Collie suite. Not started yet.
 
 See [the spec](docs/SPEC.md).
+
+Protocol conformance suite: [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
