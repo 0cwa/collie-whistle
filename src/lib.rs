@@ -130,11 +130,12 @@ fn make_app(config: &Config) -> App {
         }
     });
     let connections = config.max_connections.max(1);
+    let subscription_connections = connections - connections.div_ceil(4);
     App {
         store,
         keepalive: config.keepalive,
         body_timeout: config.body_timeout,
-        subs: Arc::new(Semaphore::new((connections * 3 / 4).max(1))),
+        subs: Arc::new(Semaphore::new(subscription_connections)),
     }
 }
 
@@ -620,5 +621,20 @@ mod tests {
         assert!(Sub::new(&app, "t9".into(), &params(true)).is_ok()); // polls are short requests
         drop(held);
         assert!(Sub::new(&app, "t9".into(), &params(false)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_single_connection_is_reserved_for_short_requests() {
+        let app = app(Config {
+            max_connections: 1,
+            ..Config::default()
+        });
+        assert_eq!(
+            Sub::new(&app, "t".into(), &params(false))
+                .err()
+                .map(|r| r.status()),
+            Some(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert!(Sub::new(&app, "t".into(), &params(true)).is_ok());
     }
 }
