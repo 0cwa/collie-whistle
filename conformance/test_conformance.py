@@ -39,6 +39,7 @@ class Run:
         self.where = ""
         self.last_publish = 0.0
         self.rejected = set()   # ids of publishes the server refused as too large
+        self.accepted = []      # expected JSON of the publishes the server accepted, in order
 
     def fill(self, s):
         return re.sub(r"\{([tm]\d+)\}", lambda m: self.vars[m.group(1)], s)
@@ -215,6 +216,8 @@ def run_step(run, i, step):
                 got = json.loads(data).get("message")
                 if got != body_cut or json.loads(data).get("encoding") != "base64":
                     run.fail("oversize publish accepted but not exactly the first %d bytes" % step["limit"])
+            if step.get("method") in ("POST", "PUT") and "json" in exp:
+                run.accepted.append(exp["json"])
             if "json" in exp:
                 try:
                     run.match(exp["json"], json.loads(data))
@@ -228,13 +231,22 @@ def run_step(run, i, step):
         else:
             st = Stream(conn, step["transport"])
             st.ends = bool(step.get("ends"))
+            st.latest = "since=latest" in path
             st.start()
             run.streams[step["stream"]] = st
     elif op == "recv":
         st = run.streams[step["stream"]]
         exp = step["expect"]
         if refers_to_rejected(run, exp.get("json")):
-            return
+            if not st.latest:
+                return
+            # since=latest returns the newest message that exists: when the server refused the
+            # oversized one that the fixture names, that is the last publish it accepted
+            topic = exp["json"]["topic"]
+            prev = [a for a in run.accepted if a["topic"] == topic]
+            if not prev:
+                return
+            exp = {"json": dict(prev[-1], id="{%s}" % prev[-1]["id"][4:-1])}
         want_ka = exp.get("json", {}).get("event") == "keepalive"
         while True:
             ev = st.next(KEEPALIVE_TIMEOUT if want_ka else TIMEOUT)

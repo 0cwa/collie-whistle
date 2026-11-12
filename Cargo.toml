@@ -1,0 +1,31 @@
+[package]
+name = "collie-whistle"
+version = "0.1.0"
+edition = "2021"
+description = "A small self-hosted UnifiedPush server that speaks the ntfy subset UnifiedPush clients use"
+publish = false
+
+[lib]
+name = "collie_whistle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "collie-whistle"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "query", "json"] }
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"
