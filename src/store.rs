@@ -8,6 +8,13 @@ use rand::distr::{Alphanumeric, SampleString};
 use serde::Serialize;
 use tokio::sync::broadcast::{self, error::TryRecvError};
 
+// Test-only scheduling point; each test thread owns its one-shot callback.
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_FIRST_RECEIVER_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// A cached message, in the shape clients read from `/json`, `/sse` and `/ws`.
 #[derive(Debug, Serialize)]
 pub struct Message {
@@ -267,6 +274,12 @@ impl Store {
                     Err(TryRecvError::Lagged(_)) => return None,
                 }
             }
+            #[cfg(test)]
+            AFTER_FIRST_RECEIVER_FOR_TEST.with(|hook| {
+                if let Some(after_scan) = hook.take() {
+                    after_scan();
+                }
+            });
         }
         batch.sort_by_key(|m| m.seq());
         Some(batch)
@@ -568,6 +581,56 @@ mod tests {
             .subscribe(&topics(&["a", "b"]), &Since::Id(third.id.clone()), false)
             .unwrap();
         assert!(resumed.backlog.is_empty());
+    }
+
+    #[test]
+    fn publication_between_receiver_scans_cannot_advance_the_cursor() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let s = store(limits());
+        let mut live = sub(&s, &["a", "b"], &Since::None).live.unwrap();
+        let first = put(&s, "a", "1");
+        let received = live.rxs[0].try_recv().unwrap();
+        let (scanned, wait_for_scan) = mpsc::channel();
+        let (attempted, wait_for_attempt) = mpsc::channel();
+        let publishing_store = s.clone();
+        let publisher = std::thread::spawn(move || {
+            wait_for_scan.recv_timeout(Duration::from_secs(5)).unwrap();
+            // If publication is excluded, let the drain finish before blocking in publish.
+            // Without that exclusion, finish both publishes in the A/B scan gap.
+            let publication_available = publishing_store.inner.try_lock().is_ok();
+            if !publication_available {
+                attempted.send(()).unwrap();
+            }
+            let second = put(&publishing_store, "a", "2");
+            let third = put(&publishing_store, "b", "3");
+            if publication_available {
+                attempted.send(()).unwrap();
+            }
+            (second, third)
+        });
+        AFTER_FIRST_RECEIVER_FOR_TEST.with(|hook| {
+            hook.replace(Some(Box::new(move || {
+                scanned.send(()).unwrap();
+                wait_for_attempt
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            })));
+        });
+
+        let batch = live.drain_ready(received).unwrap();
+        let (second, third) = publisher.join().unwrap();
+        // A publication started after A's scan belongs entirely to the next cut.
+        // Removing the drain's mutex lets this batch contain [1, 3] instead.
+        assert_eq!(texts(&batch), ["1"]);
+        let resumed = poll(&s, &["a", "b"], &Since::Id(first.id.clone()));
+        assert_eq!(texts(&resumed), ["2", "3"]);
+        let next = live.rxs[0].try_recv().unwrap();
+        assert_eq!(next.id, second.id);
+        let batch = live.drain_ready(next).unwrap();
+        assert_eq!(texts(&batch), ["2", "3"]);
+        assert!(poll(&s, &["a", "b"], &Since::Id(third.id.clone())).is_empty());
     }
 
     #[test]
