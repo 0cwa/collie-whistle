@@ -6,7 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::{self, error::TryRecvError};
 
 /// A cached message, in the shape clients read from `/json`, `/sse` and `/ws`.
 #[derive(Debug, Serialize)]
@@ -176,6 +176,12 @@ impl Drop for Live {
     }
 }
 
+impl Live {
+    pub(crate) fn drain_ready(&mut self, first: Arc<Message>) -> Option<Vec<Arc<Message>>> {
+        self.store.drain_live(&mut self.rxs, first)
+    }
+}
+
 /// What `subscribe` hands back: cached messages first, then everything live from `live`
 /// (none for a poll, which never creates a channel).
 pub struct Subscription {
@@ -239,6 +245,31 @@ impl Store {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Takes a consistent snapshot of all ready live messages.
+    ///
+    /// Publishing and this drain share the store mutex, so a lower-sequence message cannot be
+    /// published to a topic after that topic was drained but before a higher-sequence message
+    /// from another topic was drained.
+    pub(crate) fn drain_live(
+        &self,
+        rxs: &mut [broadcast::Receiver<Arc<Message>>],
+        first: Arc<Message>,
+    ) -> Option<Vec<Arc<Message>>> {
+        let _g = self.inner.lock().unwrap();
+        let mut batch = vec![first];
+        for rx in rxs {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => batch.push(m),
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                    Err(TryRecvError::Lagged(_)) => return None,
+                }
+            }
+        }
+        batch.sort_by_key(|m| m.seq());
+        Some(batch)
     }
 
     /// Topics held in memory: those with cached messages or live subscribers.
@@ -511,6 +542,32 @@ mod tests {
         assert!(matches!(quiet.rxs[0].try_recv(), Err(TryRecvError::Empty)));
         put(&s, "quiet", "hello");
         assert_eq!(quiet.rxs[0].try_recv().unwrap().message, "hello");
+    }
+
+    #[test]
+    fn ordered_drain_rechecks_a_topic_drained_before_a_later_publish() {
+        let s = store(limits());
+        let mut live = sub(&s, &["a", "b"], &Since::None).live.unwrap();
+
+        put(&s, "a", "1");
+        let first = live.rxs[0].try_recv().unwrap();
+        assert_eq!(first.seq(), 1);
+        assert!(matches!(live.rxs[0].try_recv(), Err(TryRecvError::Empty)));
+
+        // This is the gap that the former per-topic loop had between draining A and B.
+        let second = put(&s, "a", "2");
+        let third = put(&s, "b", "3");
+        let batch = live.drain_ready(first).unwrap();
+        assert_eq!(
+            batch.iter().map(|m| m.seq()).collect::<Vec<_>>(),
+            [1, second.seq(), third.seq()]
+        );
+
+        // A reconnect at the last delivered ID sees no older message left behind it.
+        let resumed = s
+            .subscribe(&topics(&["a", "b"]), &Since::Id(third.id.clone()), false)
+            .unwrap();
+        assert!(resumed.backlog.is_empty());
     }
 
     #[test]

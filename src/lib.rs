@@ -32,7 +32,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::broadcast::{self, error::RecvError, error::TryRecvError};
+use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval_at, sleep_until, timeout, Instant, Interval, MissedTickBehavior};
 
@@ -375,20 +375,9 @@ impl Sub {
         let live = self.live.as_mut()?;
         tokio::select! {
             r = recv_any(&mut live.rxs) => {
-                let mut batch = vec![r.ok()?];
-                // The channels are per topic, so a later message of one topic can wake us before
-                // an earlier one of another: take everything that is ready and deliver by
-                // publish order. KUnifiedPush keeps one last-message id for all its topics.
-                for rx in live.rxs.iter_mut() {
-                    loop {
-                        match rx.try_recv() {
-                            Ok(m) => batch.push(m),
-                            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-                            Err(TryRecvError::Lagged(_)) => return None,
-                        }
-                    }
-                }
-                batch.sort_by_key(|m| m.seq());
+                // Publish and drain take the store mutex. The per-topic channels can therefore
+                // be drained as one consistent snapshot before advancing the shared cursor.
+                let batch = live.drain_ready(r.ok()?)?;
                 self.queue.extend(batch);
                 self.queue.pop_front().map(Event::Message)
             },
@@ -570,6 +559,50 @@ mod tests {
         for i in 0..50 {
             assert_eq!(text(&mut sub).await, i.to_string());
         }
+    }
+
+    #[tokio::test]
+    async fn a_cross_topic_cursor_does_not_skip_a_message_published_during_live_delivery() {
+        let app = app(Config::default());
+        let mut sub = Sub::new(&app, "a,b".into(), &params(false)).ok().unwrap();
+        assert!(matches!(sub.next().await, Some(Event::Open)));
+
+        let first = app.store.publish("a", "1".into(), None).unwrap();
+        assert_eq!(text(&mut sub).await, "1");
+
+        // Topic A's earlier message and topic B's later message are both pending when the
+        // subscriber wakes. They must be delivered in sequence order before its shared cursor
+        // can advance to B's ID.
+        let second = app.store.publish("a", "2".into(), None).unwrap();
+        let third = app.store.publish("b", "3".into(), None).unwrap();
+        assert_eq!(text(&mut sub).await, "2");
+        assert_eq!(text(&mut sub).await, "3");
+
+        let resumed = app
+            .store
+            .subscribe(
+                &parse_topics("a,b").unwrap(),
+                &Since::Id(first.id.clone()),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            resumed
+                .backlog
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            [second.id.as_str(), third.id.as_str()]
+        );
+        let resumed = app
+            .store
+            .subscribe(
+                &parse_topics("a,b").unwrap(),
+                &Since::Id(third.id.clone()),
+                false,
+            )
+            .unwrap();
+        assert!(resumed.backlog.is_empty());
     }
 
     #[tokio::test]
