@@ -6,7 +6,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::{self, error::TryRecvError};
+
+// Test-only scheduling point; each test thread owns its one-shot callback.
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_FIRST_RECEIVER_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
 
 /// A cached message, in the shape clients read from `/json`, `/sse` and `/ws`.
 #[derive(Debug, Serialize)]
@@ -176,6 +183,12 @@ impl Drop for Live {
     }
 }
 
+impl Live {
+    pub(crate) fn drain_ready(&mut self, first: Arc<Message>) -> Option<Vec<Arc<Message>>> {
+        self.store.drain_live(&mut self.rxs, first)
+    }
+}
+
 /// What `subscribe` hands back: cached messages first, then everything live from `live`
 /// (none for a poll, which never creates a channel).
 pub struct Subscription {
@@ -239,6 +252,37 @@ impl Store {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Takes a consistent snapshot of all ready live messages.
+    ///
+    /// Publishing and this drain share the store mutex, so a lower-sequence message cannot be
+    /// published to a topic after that topic was drained but before a higher-sequence message
+    /// from another topic was drained.
+    pub(crate) fn drain_live(
+        &self,
+        rxs: &mut [broadcast::Receiver<Arc<Message>>],
+        first: Arc<Message>,
+    ) -> Option<Vec<Arc<Message>>> {
+        let _g = self.inner.lock().unwrap();
+        let mut batch = vec![first];
+        for rx in rxs {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => batch.push(m),
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                    Err(TryRecvError::Lagged(_)) => return None,
+                }
+            }
+            #[cfg(test)]
+            AFTER_FIRST_RECEIVER_FOR_TEST.with(|hook| {
+                if let Some(after_scan) = hook.take() {
+                    after_scan();
+                }
+            });
+        }
+        batch.sort_by_key(|m| m.seq());
+        Some(batch)
     }
 
     /// Topics held in memory: those with cached messages or live subscribers.
@@ -511,6 +555,82 @@ mod tests {
         assert!(matches!(quiet.rxs[0].try_recv(), Err(TryRecvError::Empty)));
         put(&s, "quiet", "hello");
         assert_eq!(quiet.rxs[0].try_recv().unwrap().message, "hello");
+    }
+
+    #[test]
+    fn ordered_drain_rechecks_a_topic_drained_before_a_later_publish() {
+        let s = store(limits());
+        let mut live = sub(&s, &["a", "b"], &Since::None).live.unwrap();
+
+        put(&s, "a", "1");
+        let first = live.rxs[0].try_recv().unwrap();
+        assert_eq!(first.seq(), 1);
+        assert!(matches!(live.rxs[0].try_recv(), Err(TryRecvError::Empty)));
+
+        // This is the gap that the former per-topic loop had between draining A and B.
+        let second = put(&s, "a", "2");
+        let third = put(&s, "b", "3");
+        let batch = live.drain_ready(first).unwrap();
+        assert_eq!(
+            batch.iter().map(|m| m.seq()).collect::<Vec<_>>(),
+            [1, second.seq(), third.seq()]
+        );
+
+        // A reconnect at the last delivered ID sees no older message left behind it.
+        let resumed = s
+            .subscribe(&topics(&["a", "b"]), &Since::Id(third.id.clone()), false)
+            .unwrap();
+        assert!(resumed.backlog.is_empty());
+    }
+
+    #[test]
+    fn publication_between_receiver_scans_cannot_advance_the_cursor() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let s = store(limits());
+        let mut live = sub(&s, &["a", "b"], &Since::None).live.unwrap();
+        let first = put(&s, "a", "1");
+        let received = live.rxs[0].try_recv().unwrap();
+        let (scanned, wait_for_scan) = mpsc::channel();
+        let (attempted, wait_for_attempt) = mpsc::channel();
+        let publishing_store = s.clone();
+        let publisher = std::thread::spawn(move || {
+            wait_for_scan.recv_timeout(Duration::from_secs(5)).unwrap();
+            // If publication is excluded, let the drain finish before blocking in publish.
+            // Without that exclusion, finish both publishes in the A/B scan gap.
+            let publication_available = publishing_store.inner.try_lock().is_ok();
+            if !publication_available {
+                attempted.send(()).unwrap();
+            }
+            let second = put(&publishing_store, "a", "2");
+            let third = put(&publishing_store, "b", "3");
+            if publication_available {
+                attempted.send(()).unwrap();
+            }
+            (second, third)
+        });
+        AFTER_FIRST_RECEIVER_FOR_TEST.with(|hook| {
+            hook.replace(Some(Box::new(move || {
+                scanned.send(()).unwrap();
+                wait_for_attempt
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            })));
+        });
+
+        let batch = live.drain_ready(received).unwrap();
+        let (second, third) = publisher.join().unwrap();
+        // A publication started after A's scan belongs entirely to the next cut.
+        // Removing the drain's mutex lets this batch contain [1, 3] instead.
+        assert_eq!(texts(&batch), ["1"]);
+        let resumed = poll(&s, &["a", "b"], &Since::Id(first.id.clone()));
+        assert_eq!(texts(&resumed), ["2", "3"]);
+        let next = live.rxs[0].try_recv().unwrap();
+        assert_eq!(next.id, second.id);
+        let batch = live.drain_ready(next).unwrap();
+        assert_eq!(texts(&batch), ["2", "3"]);
+        assert!(poll(&s, &["a", "b"], &Since::Id(third.id.clone())).is_empty());
     }
 
     #[test]
