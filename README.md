@@ -35,17 +35,33 @@ Configuration is by environment variable:
 | `WHISTLE_MAX_SUBSCRIBERS_PER_TOPIC` | `16` | live subscribers of one topic; more get 429 |
 | `WHISTLE_MAX_CONNECTIONS` | `512` | open connections at once; more wait to be accepted. Three quarters may be live subscriptions, so publishers and `/v1/health` keep room |
 | `WHISTLE_KEEPALIVE_SECONDS` | `45` | keepalive event / WebSocket ping interval |
+| `WHISTLE_TOKEN` | unset | token that subscribers must present (see below); unset, anyone may subscribe |
 
 A client gets 10 s to send its request header and a publisher 10 s to send its body, and a
 connection that accepts no data for 60 s is closed. A
 WebSocket that sends no frame (pongs count) for two keepalive intervals is dropped.
 
 The cache lives in memory: a restart forgets undelivered messages, and clients that reconnect
-with an unknown `since=` id get everything still cached (nothing, after a restart). There is no
-authentication yet: anyone who knows a topic name can publish to it and read it, so topics
-should stay high-entropy, as the distributors generate them. Message bodies longer than 4096
-bytes are cut to their first 4096 bytes, as stock ntfy does; a text body cut in the middle of a
-character stops being valid UTF-8, so it is then stored as base64.
+with an unknown `since=` id get everything still cached (nothing, after a restart). Message
+bodies longer than 4096 bytes are cut to their first 4096 bytes, as stock ntfy does; a text
+body cut in the middle of a character stops being valid UTF-8, so it is then stored as base64.
+
+Without `WHISTLE_TOKEN`, anyone who knows a topic name can publish to it and read it, so
+topics should stay high-entropy, as the distributors generate them. With it, subscribing
+(`/json`, `/sse`, `/ws`, also with `poll=1`) needs the token, so nobody else can read your
+topics or use the server as their own push service. Publishing, discovery and `/v1/health`
+stay open: a UnifiedPush application server only gets the endpoint URL from the distributor
+and has no way to add a token, which is also why ntfy's docs give anonymous write access to
+`up*` topics on a private server. Anyone who knows a topic can still publish to it, so topics
+must still be high-entropy.
+
+Subscribers send the token the way ntfy clients do. KUnifiedPush: set the ntfy provider's
+authentication to Bearer with the token as secret. ntfy Android: add a user for the server
+with any user name and the token as password, or a custom header
+`Authorization: Bearer <token>`. Clients that can only change the URL can add
+`?auth=<base64url of "Bearer <token>">`, as ntfy accepts. A request without credentials gets
+403, one with a wrong token 401, as ntfy answers. The token is compared in constant time and
+never logged; it must be printable ASCII without spaces.
 
 The limits above are mitigation, not protection. Whistle has no client identity, so every
 limit is global or per topic: a determined client can still use up a limit and make others

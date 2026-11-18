@@ -12,6 +12,22 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
+/// Reads `WHISTLE_TOKEN`. Unlike [`env`], an error never prints the value.
+fn token() -> Option<collie_whistle::Token> {
+    let v = std::env::var_os("WHISTLE_TOKEN")?;
+    match v.to_str().map(str::parse) {
+        Some(Ok(t)) => Some(t),
+        Some(Err(why)) => {
+            eprintln!("collie-whistle: cannot use WHISTLE_TOKEN: {why}");
+            std::process::exit(2)
+        }
+        None => {
+            eprintln!("collie-whistle: cannot use WHISTLE_TOKEN: it is not valid UTF-8");
+            std::process::exit(2)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let d = Config::default();
@@ -35,6 +51,7 @@ async fn main() {
         keepalive: Duration::from_secs(
             env("WHISTLE_KEEPALIVE_SECONDS", d.keepalive.as_secs()).max(1),
         ),
+        token: token(),
         ..d
     };
     let listener = tokio::net::TcpListener::bind(&listen)

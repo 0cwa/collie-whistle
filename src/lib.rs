@@ -22,7 +22,7 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
@@ -75,6 +75,33 @@ pub struct Config {
     pub body_timeout: Duration,
     /// Time a client gets to accept data the server is sending before the connection is closed.
     pub write_timeout: Duration,
+    /// When set, subscribing (`/json`, `/sse`, `/ws`, also with `poll=1`) needs this token.
+    /// Publishing stays open: UnifiedPush application servers only have the endpoint URL.
+    pub token: Option<Token>,
+}
+
+/// A token subscribers must present, the way ntfy clients send one: `Authorization: Bearer`,
+/// Basic auth with the token as password, or the `auth` query parameter. Its `Debug` output
+/// hides the value, so a logged [`Config`] does not leak it.
+#[derive(Clone)]
+pub struct Token(String);
+
+impl std::str::FromStr for Token {
+    type Err = &'static str;
+
+    /// Refuses an empty token, and characters a client could not send in a header unchanged.
+    fn from_str(s: &str) -> Result<Token, Self::Err> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("a token must be non-empty printable ASCII without spaces");
+        }
+        Ok(Token(s.to_string()))
+    }
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(..)")
+    }
 }
 
 impl Default for Config {
@@ -93,6 +120,7 @@ impl Default for Config {
             header_timeout: Duration::from_secs(10),
             body_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(60),
+            token: None,
         }
     }
 }
@@ -102,6 +130,7 @@ struct App {
     store: Arc<Store>,
     keepalive: Duration,
     body_timeout: Duration,
+    token: Option<Arc<Token>>,
     /// Permits for live subscriptions: a share of the connection cap, so that publishers and
     /// health checks always find room.
     subs: Arc<Semaphore>,
@@ -135,6 +164,7 @@ fn make_app(config: &Config) -> App {
         store,
         keepalive: config.keepalive,
         body_timeout: config.body_timeout,
+        token: config.token.clone().map(Arc::new),
         subs: Arc::new(Semaphore::new(subscription_connections)),
     }
 }
@@ -230,6 +260,66 @@ fn parse_topics(s: &str) -> Result<HashSet<String>, Response> {
     }
 }
 
+// ---- token
+
+/// Checks the token like stock ntfy reads credentials: the `authorization` or `auth` query
+/// parameter (the header value, base64url encoded) wins over the `Authorization` header. No
+/// credentials get 403, as ntfy answers an anonymous client; wrong ones get 401.
+fn authorize(app: &App, headers: &HeaderMap, q: &Params) -> Result<(), Response> {
+    let Some(token) = &app.token else {
+        return Ok(());
+    };
+    let forbidden = || error(StatusCode::FORBIDDEN, 40301, "forbidden");
+    let unauthorized = || error(StatusCode::UNAUTHORIZED, 40101, "unauthorized");
+    let query = [&q.authorization, &q.auth]
+        .into_iter()
+        .flatten()
+        .map(|v| v.trim())
+        .find(|v| !v.is_empty());
+    let value = match query {
+        Some(v) => base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(v.trim_end_matches('='))
+            .map_err(|_| unauthorized())?,
+        None => match headers.get(header::AUTHORIZATION) {
+            Some(h) => h.as_bytes().to_vec(),
+            None => return Err(forbidden()),
+        },
+    };
+    let value = value.trim_ascii();
+    let scheme =
+        |name: &[u8]| value.len() > name.len() && value[..name.len()].eq_ignore_ascii_case(name);
+    let presented = if scheme(b"bearer ") {
+        value[7..].trim_ascii().to_vec()
+    } else if scheme(b"basic ") {
+        // ntfy takes the password as a token when the user name is empty. ntfy Android
+        // requires a user name, so any user name is accepted here.
+        let pair = base64::engine::general_purpose::STANDARD
+            .decode(value[6..].trim_ascii())
+            .map_err(|_| unauthorized())?;
+        match pair.iter().position(|&b| b == b':') {
+            Some(i) => pair[i + 1..].to_vec(),
+            None => return Err(unauthorized()),
+        }
+    } else {
+        // no credentials, or a scheme ntfy ignores, such as a VAPID header
+        return Err(forbidden());
+    };
+    if same_secret(&presented, token.0.as_bytes()) {
+        Ok(())
+    } else {
+        Err(unauthorized())
+    }
+}
+
+/// Compares every byte, so the time taken shows at most the lengths, not where the inputs differ.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = u8::from(a.len() != b.len());
+    for i in 0..a.len().max(b.len()) {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    std::hint::black_box(diff) == 0
+}
+
 // ---- publish and discovery
 
 #[derive(Deserialize)]
@@ -237,6 +327,8 @@ struct Params {
     up: Option<String>,
     since: Option<String>,
     poll: Option<String>,
+    auth: Option<String>,
+    authorization: Option<String>,
 }
 
 fn flag(v: &Option<String>) -> bool {
@@ -441,8 +533,9 @@ async fn sub_json(
     State(app): State<App>,
     Path(topics): Path<String>,
     Query(q): Query<Params>,
+    headers: HeaderMap,
 ) -> Response {
-    match Sub::new(&app, topics, &q) {
+    match authorize(&app, &headers, &q).and_then(|()| Sub::new(&app, topics, &q)) {
         Ok(sub) => stream_response(
             "application/x-ndjson; charset=utf-8",
             event_stream(sub, false),
@@ -455,8 +548,9 @@ async fn sub_sse(
     State(app): State<App>,
     Path(topics): Path<String>,
     Query(q): Query<Params>,
+    headers: HeaderMap,
 ) -> Response {
-    match Sub::new(&app, topics, &q) {
+    match authorize(&app, &headers, &q).and_then(|()| Sub::new(&app, topics, &q)) {
         Ok(sub) => stream_response("text/event-stream; charset=utf-8", event_stream(sub, true)),
         Err(e) => e,
     }
@@ -466,9 +560,10 @@ async fn sub_ws(
     State(app): State<App>,
     Path(topics): Path<String>,
     Query(q): Query<Params>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    match Sub::new(&app, topics, &q) {
+    match authorize(&app, &headers, &q).and_then(|()| Sub::new(&app, topics, &q)) {
         Ok(sub) => upgrade
             .max_message_size(MAX_BODY)
             .max_frame_size(MAX_BODY)
@@ -530,6 +625,8 @@ mod tests {
             up: None,
             since: None,
             poll: poll.then(|| "1".to_string()),
+            auth: None,
+            authorization: None,
         }
     }
 

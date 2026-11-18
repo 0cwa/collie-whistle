@@ -22,6 +22,11 @@ works for any UnifiedPush app.
 - A message cache of about 1 hour, kept in memory in v1: a restart drops pending messages
   (a persistent cache can come later). Per-topic and global limits, an optional bearer token
   and high-entropy topics.
+- The token guards subscribing only. Application servers publish to the endpoint URL the
+  distributor hands out and cannot add one; both distributors can send one on subscribe
+  (KUnifiedPush: Bearer or Basic; ntfy Android: Basic from a user, or a custom header).
+  Credentials are read as stock ntfy reads them: `Authorization: Bearer`, Basic with the
+  token as password, or `?auth=`. None is 403, a wrong one 401.
 
 Nothing else. No attachments, accounts or web UI.
 
