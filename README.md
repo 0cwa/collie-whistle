@@ -60,8 +60,10 @@ authentication to Bearer with the token as secret. ntfy Android: add a user for 
 with any user name and the token as password, or a custom header
 `Authorization: Bearer <token>`. Clients that can only change the URL can add
 `?auth=<base64url of "Bearer <token>">`, as ntfy accepts. A request without credentials gets
-403, one with a wrong token 401, as ntfy answers. The token is compared in constant time and
-never logged; it must be printable ASCII without spaces.
+403, one with a wrong token 401, as ntfy answers. Prefer the header where the client allows
+it: a reverse proxy may log the URL. Whistle compares the token in constant time and never
+logs it, but does not limit wrong guesses, so use a long random one (`openssl rand -hex 32`);
+it must be printable ASCII without spaces.
 
 The limits above are mitigation, not protection. Whistle has no client identity, so every
 limit is global or per topic: a determined client can still use up a limit and make others

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -265,17 +265,20 @@ fn parse_topics(s: &str) -> Result<HashSet<String>, Response> {
 /// Checks the token like stock ntfy reads credentials: the `authorization` or `auth` query
 /// parameter (the header value, base64url encoded) wins over the `Authorization` header. No
 /// credentials get 403, as ntfy answers an anonymous client; wrong ones get 401.
-fn authorize(app: &App, headers: &HeaderMap, q: &Params) -> Result<(), Response> {
+/// The query is read here rather than through [`Params`], so that a repeated `auth` key is no
+/// error and nothing changes without a token.
+fn authorize(app: &App, headers: &HeaderMap, query: Option<&str>) -> Result<(), Response> {
     let Some(token) = &app.token else {
         return Ok(());
     };
     let forbidden = || error(StatusCode::FORBIDDEN, 40301, "forbidden");
     let unauthorized = || error(StatusCode::UNAUTHORIZED, 40101, "unauthorized");
-    let query = [&q.authorization, &q.auth]
-        .into_iter()
-        .flatten()
-        .map(|v| v.trim())
-        .find(|v| !v.is_empty());
+    // like ntfy: the first value of `authorization`, else of `auth`, if not blank
+    let pairs: Vec<_> = form_urlencoded::parse(query.unwrap_or("").as_bytes()).collect();
+    let query = ["authorization", "auth"].into_iter().find_map(|name| {
+        let (_, v) = pairs.iter().find(|(k, _)| k == name)?;
+        Some(v.trim()).filter(|v| !v.is_empty())
+    });
     let value = match query {
         Some(v) => base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(v.trim_end_matches('='))
@@ -327,8 +330,6 @@ struct Params {
     up: Option<String>,
     since: Option<String>,
     poll: Option<String>,
-    auth: Option<String>,
-    authorization: Option<String>,
 }
 
 fn flag(v: &Option<String>) -> bool {
@@ -533,9 +534,10 @@ async fn sub_json(
     State(app): State<App>,
     Path(topics): Path<String>,
     Query(q): Query<Params>,
+    RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    match authorize(&app, &headers, &q).and_then(|()| Sub::new(&app, topics, &q)) {
+    match authorize(&app, &headers, raw.as_deref()).and_then(|()| Sub::new(&app, topics, &q)) {
         Ok(sub) => stream_response(
             "application/x-ndjson; charset=utf-8",
             event_stream(sub, false),
@@ -548,9 +550,10 @@ async fn sub_sse(
     State(app): State<App>,
     Path(topics): Path<String>,
     Query(q): Query<Params>,
+    RawQuery(raw): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    match authorize(&app, &headers, &q).and_then(|()| Sub::new(&app, topics, &q)) {
+    match authorize(&app, &headers, raw.as_deref()).and_then(|()| Sub::new(&app, topics, &q)) {
         Ok(sub) => stream_response("text/event-stream; charset=utf-8", event_stream(sub, true)),
         Err(e) => e,
     }
@@ -560,10 +563,11 @@ async fn sub_ws(
     State(app): State<App>,
     Path(topics): Path<String>,
     Query(q): Query<Params>,
+    RawQuery(raw): RawQuery,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    match authorize(&app, &headers, &q).and_then(|()| Sub::new(&app, topics, &q)) {
+    match authorize(&app, &headers, raw.as_deref()).and_then(|()| Sub::new(&app, topics, &q)) {
         Ok(sub) => upgrade
             .max_message_size(MAX_BODY)
             .max_frame_size(MAX_BODY)
@@ -625,8 +629,6 @@ mod tests {
             up: None,
             since: None,
             poll: poll.then(|| "1".to_string()),
-            auth: None,
-            authorization: None,
         }
     }
 

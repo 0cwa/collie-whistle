@@ -15,10 +15,14 @@ use tokio::net::{TcpListener, TcpStream};
 const TOKEN: &str = "tk_Whistle-test-0123456789";
 
 async fn start() -> String {
+    start_with(Some(TOKEN)).await
+}
+
+async fn start_with(token: Option<&str>) -> String {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
     let config = Config {
-        token: Some(TOKEN.parse().unwrap()),
+        token: token.map(|t| t.parse().unwrap()),
         ..Config::default()
     };
     tokio::spawn(serve(l, config));
@@ -156,6 +160,15 @@ async fn subscribers_present_the_token_the_ways_ntfy_clients_do() {
         ),
         (format!("/upauth/json?poll=1&{query}"), None),
         (format!("/upauth/json?poll=1&{query}=="), None), // padded base64 too
+        // like ntfy: `authorization` before `auth`, and the first value of a repeated key
+        (
+            format!(
+                "/upauth/json?poll=1&auth=bad&{}",
+                query.replacen("auth", "authorization", 1)
+            ),
+            None,
+        ),
+        (format!("/upauth/json?poll=1&{query}&auth=bad"), None),
     ];
     for (path, auth) in &ways {
         let (st, body) = get(&addr, path, auth.as_deref()).await;
@@ -171,6 +184,17 @@ async fn subscribers_present_the_token_the_ways_ntfy_clients_do() {
          Authorization: {bearer}"
     );
     assert_eq!(request(&addr, &ws, b"").await.0, 101);
+}
+
+#[tokio::test]
+async fn without_a_token_credentials_are_ignored() {
+    let addr = start_with(None).await;
+    let (st, _) = request(&addr, "POST /upfree?up=1&auth=a&auth=b HTTP/1.0", b"hi").await;
+    assert_eq!(st, 200);
+    let path = "/upfree/json?poll=1&auth=a&auth=b&authorization=c";
+    let (st, body) = get(&addr, path, Some("Bearer wrong")).await;
+    assert_eq!(st, 200);
+    assert!(body.contains("\"message\":\"hi\""), "{body}");
 }
 
 #[test]
