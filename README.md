@@ -5,12 +5,10 @@ Collie suite.
 
 See [the spec](docs/SPEC.md).
 
-Protocol conformance suite: [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
-
 ## Run it
 
 ```
-cargo build --release
+cargo build --release --locked
 target/release/collie-whistle
 ```
 
@@ -43,8 +41,8 @@ WebSocket that sends no frame (pongs count) for two keepalive intervals is dropp
 
 The cache lives in memory: a restart forgets undelivered messages, and clients that reconnect
 with an unknown `since=` id get everything still cached (nothing, after a restart). Message
-bodies longer than 4096 bytes are cut to their first 4096 bytes, as stock ntfy does; a text
-body cut in the middle of a character stops being valid UTF-8, so it is then stored as base64.
+bodies longer than 4096 bytes are cut to their first 4096 bytes. For UnifiedPush publishes
+(`?up=1`), invalid UTF-8—including a character cut by truncation—is stored as base64.
 
 Without `WHISTLE_TOKEN`, anyone who knows a topic name can publish to it and read it, so
 topics should stay high-entropy, as the distributors generate them. With it, subscribing
@@ -70,7 +68,7 @@ limit is global or per topic: a determined client can still use up a limit and m
 wait or get 429. For a server reachable from the internet, also limit per client address in
 the reverse proxy or tunnel in front of it.
 
-`cargo test` runs the unit and socket tests. The protocol conformance suite runs against the
+`cargo test --locked` runs the unit and socket tests. The protocol conformance suite runs against the
 built binary (see [docs/CONFORMANCE.md](docs/CONFORMANCE.md)):
 
 ```
