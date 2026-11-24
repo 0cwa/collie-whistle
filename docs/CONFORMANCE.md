@@ -1,12 +1,12 @@
 # Conformance suite
 
-`conformance/` replays conversations recorded from real UnifiedPush clients against any
-HTTP base URL. It needs only Python 3 and no packages.
+`conformance/` replays real UnifiedPush client recordings and reference calls against any
+HTTP base URL. It needs only Python 3 and no packages. Run from the repository root:
 
 ```
-conformance/run.sh http://127.0.0.1:8080            # whole suite, about 2 minutes
-WHISTLE_FAST=1 conformance/run.sh http://...        # skips the 45 s keepalive waits, about 45 s
-conformance/selftest.sh                              # proves the suite fails on a wrong server
+conformance/run.sh http://127.0.0.1:8080               # whole suite, as run in CI
+WHISTLE_FAST=1 conformance/run.sh http://127.0.0.1:8080 # skips keepalive waits
+conformance/selftest.sh                              # checks rejection of a deliberately wrong server
 ```
 
 `run.sh` fails if no test ran. The server needs rate limits high enough for roughly 60
@@ -22,7 +22,7 @@ requests per run; for stock ntfy set `visitor-request-limit-burst: 1000`.
 | `ws-ping` | hand-written, **reference** | `/ws` open event, and a ping answered with a pong, which ntfy Android relies on |
 | `app-server` | curl, **reference only** | discovery `GET /{topic}?up=1`, publish, and `poll=1` with `since=all`, `latest`, `none`, `<id>`, two topics, `/sse`; each poll must end by itself. Neither distributor sends these, so the calls are written by hand and the expected answers are what stock ntfy returned |
 
-A fixture is a JSON list of steps (`request`, `open`, `recv`, `ping`, `close`) with the
+A fixture is a JSON object with a `steps` list (`request`, `open`, `recv`, `ping`, `close`) and the
 exact bytes sent; a fixture with no steps fails. Normalization keeps secrets and
 randomness out: topics are `{t1}`, `{t2}`, message ids are `<id:m1>` where first seen
 and `{m1}` after, `time` and `expires` are `<int>`, and Authorization, cookie and host
@@ -38,7 +38,8 @@ What a reply must satisfy, so that a provider need not copy ntfy beyond what cli
   other name for a keepalive. These are exactly the three cases KUnifiedPush tells apart.
 - `recv` skips keepalives unless it expects one. `poll=1` responses must end.
 - A body over 4096 bytes may be answered with 200 and exactly the first 4096 bytes
-  delivered, or with 413 (the messages that depend on it are then skipped).
+  delivered, or with 413. Rejected-message expectations are skipped; `since=latest`
+  then expects the last accepted message for that topic.
 - Steps that publish are spaced 1.1 s apart, and a reconnect with `since=` waits likewise.
 
 ## Versions recorded (2026-11-11)
@@ -52,7 +53,7 @@ What a reply must satisfy, so that a provider need not copy ntfy beyond what cli
 - KUnifiedPush 26.08.2 (`kunifiedpush-distributor`, Fedora 44 package `kunifiedpush-26.08.2-1.fc44`)
   with its `Ntfy` push provider, in a podman container (image
   `ghcr.io/ublue-os/fedora-toolbox@sha256:152d578a893dc0d96239f92b50e46d3d238c0b4aebca89094ee118f3a407af77`)
-  with a private D-Bus session. Fedora may drop that package build later; then the version moves.
+  with a private D-Bus session.
 - mitmproxy 12.3.1 (`conformance/record/requirements.txt`) as the recording reverse proxy
 
 Everything ran against a local ntfy. No public server was contacted.
@@ -63,63 +64,72 @@ Two stand-ins, both only on the app side of the clients. Android: the UnifiedPus
 KUnifiedPush: `Register` is called over D-Bus with `gdbus`, and `record/connector.py` owns
 the connector service names and logs what the distributor delivers, so delivery of the
 exact payload bytes (4096 bytes for the 4096 and 4097 byte publishes) was seen at the
-connector. Nothing in the fixtures is derived from source: all client traffic was recorded.
+connector. The three client fixtures use recorded traffic; the two reference fixtures
+are identified in the table above.
 
 ## Re-record
 
 Needs podman, an Android SDK with the API 35 `google_apis` x86_64 system image, curl, and
 a venv with `pip install -r conformance/record/requirements.txt`. Keep scratch outside the repository.
 
-```
+```sh
+# Start in the repository root; set the downloaded APK's absolute path.
+whistle_repo=$PWD
+whistle_apk=/absolute/path/to/ntfy-1.25.2-fdroid-debug.apk
+whistle_recording=$(mktemp -d)
+cd "$whistle_recording"
+
 # 1. stock ntfy 2.37.2 behind a recording proxy
-ntfy serve -c conformance/record/server.yml &
+ntfy serve -c "$whistle_repo/conformance/record/server.yml" &
 REC_OUT=raw.jsonl mitmdump --mode reverse:http://127.0.0.1:12586@0.0.0.0:12587 \
-    -s conformance/record/addon.py &
+    -s "$whistle_repo/conformance/record/addon.py" &
 
 # 2. emulator with the Android app, and the KUnifiedPush container
-export ANDROID_SDK_ROOT=$HOME/Android/Sdk ANDROID_AVD_HOME=$PWD/avd; mkdir -p $ANDROID_AVD_HOME
-echo no | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager create avd -n whistle-rec \
+export ANDROID_SDK_ROOT=$HOME/Android/Sdk ANDROID_AVD_HOME=$PWD/avd
+mkdir -p "$ANDROID_AVD_HOME"
+echo no | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" create avd -n whistle-rec \
     -k "system-images;android-35;google_apis;x86_64" -d pixel_6
-$ANDROID_SDK_ROOT/emulator/emulator -avd whistle-rec -no-window -no-audio -no-snapshot -no-boot-anim &
-adb wait-for-device; adb install ntfy-1.25.2-fdroid-debug.apk
-conformance/record/setup-kup.sh whistle-kup
+"$ANDROID_SDK_ROOT/emulator/emulator" -avd whistle-rec -no-window -no-audio -no-snapshot -no-boot-anim &
+adb wait-for-device; adb install "$whistle_apk"
+"$whistle_repo/conformance/record/setup-kup.sh" whistle-kup
 
 # 3. drive the clients; each script writes its scenario to raw.jsonl through the proxy
 export BASE=http://127.0.0.1:12587 RAW=$PWD/raw.jsonl ADB=adb
-conformance/record/appserver.sh
-conformance/record/android.sh jsonhttp
-conformance/record/android.sh ws
-conformance/record/kup.sh
+"$whistle_repo/conformance/record/appserver.sh"
+"$whistle_repo/conformance/record/android.sh" jsonhttp
+"$whistle_repo/conformance/record/android.sh" ws
+"$whistle_repo/conformance/record/kup.sh"
 
-# 4. normalize into fixtures (one call per scenario, with its client label)
-conformance/record/normalize-all.sh raw.jsonl
+# 4. normalize into scratch fixtures for review
+"$whistle_repo/conformance/record/normalize-all.sh" "$RAW" "$whistle_recording/fixtures"
 ```
 
 `ws-ping.json` is written by hand; mitmproxy does not log WebSocket control frames.
-Afterwards remove the emulator, AVD and container (`adb emu kill`, `podman rm -f whistle-kup`).
+Review the four generated fixtures before replacing the committed copies. If recording
+different versions, update the labels in `normalize-all.sh` and the provenance above.
+Afterwards stop ntfy and the proxy, and remove the emulator, AVD and container
+(`adb emu kill`, `podman rm -f whistle-kup`).
 Two things the drivers had to get right: KUnifiedPush purges clients whose D-Bus service
 is not *activatable* (it needs a `.service` file, which `kup.sh` writes), and the Android
 foreground service only starts while the app is in the foreground.
 
-## Where the real calls differ from the first spec estimate
+## Recorded client behaviour
 
-See "What recording showed" in [SPEC.md](SPEC.md). In short: KUnifiedPush uses `/sse`,
-which was not in scope; neither client calls discovery or `poll=1`; registration makes no
-HTTP call; over-limit bodies are truncated by stock ntfy rather than rejected (the suite
-allows 413 too); `/ws` keepalive is a ping frame, not a JSON event; stock ntfy has
-one-second ordering and a default rate limit that tests have to work around.
+Neither client calls discovery or `poll=1`, and registration makes no HTTP call.
+Stock ntfy truncates over-limit bodies; the suite also accepts 413 as described above.
+WebSocket ping/pong is covered by the reference fixture because the recording proxy
+does not log control frames.
 
 ### Does a provider have to accept a `since` id from another topic?
 
 Yes. In `kup-sse.json`, after the second app unregisters, KUnifiedPush opens
 `/{t1}/sse?up=1&since={m11}` where `m11` is a message on `{t2}`, the topic just removed.
-The source shows why: `NtfyPushProvider` keeps a single `m_lastMessageId` for all topics
-and uses it on every reconnect. Stock ntfy resolves the id globally and returns messages
-after it. An id it does not know returns everything (as `since=all`), which a provider
-may copy or replace with something stricter, since this only follows cache expiry.
+Stock ntfy resolves the id globally and returns messages after it. Behaviour for an id
+outside the cache is not covered by these recordings.
 
 ## Not covered
 
-- Authenticated topics (`Authorization: Bearer`): both clients can send it, nobody sent it here.
+- Authenticated real-client recordings (`Authorization: Bearer`): neither client sent it here.
+  Server token behaviour has separate coverage in [tests/token.rs](../tests/token.rs).
 - Long idle beyond one keepalive, and messages older than the cache window.
 - Rate-limit rejections (429) and other error replies: no client behaviour depends on them here.
