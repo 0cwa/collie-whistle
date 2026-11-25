@@ -78,3 +78,34 @@ conformance/run.sh http://127.0.0.1:8080
 
 `tools/android-proof/` has the script that checks a 4096-byte binary payload reaches the stock
 ntfy Android app's connector intact, including after a reconnect (needs an emulator).
+
+## Containers
+
+The image runs as a non-root user on Linux amd64 and arm64. It listens on
+`0.0.0.0:8080` inside the container by default and accepts the same environment
+variables as the standalone binary.
+
+Generate a subscription token and keep it for configuring your distributors.
+
+```sh
+export WHISTLE_TOKEN=$(openssl rand -hex 32)
+```
+
+With Docker, build and run from the repository root.
+
+```sh
+docker build -f Containerfile -t collie-whistle .
+docker run --rm -e WHISTLE_TOKEN -p 127.0.0.1:8080:8080 collie-whistle
+```
+
+With rootless Podman, run these commands as your usual user.
+
+```sh
+podman build -f Containerfile -t localhost/collie-whistle .
+podman run --rm -e WHISTLE_TOKEN -p 127.0.0.1:8080:8080 localhost/collie-whistle
+```
+
+Point a TLS reverse proxy on the host at `http://127.0.0.1:8080`. If you run
+both services in Compose, leave Whistle's port unpublished and point the TLS
+reverse proxy at `http://whistle:8080` over their shared network, using `whistle`
+as the service name.
