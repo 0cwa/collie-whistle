@@ -28,3 +28,39 @@ jobs:
           for _ in $(seq 50); do curl -fs http://127.0.0.1:8080/v1/health && break; sleep 0.2; done
           curl -fs http://127.0.0.1:8080/v1/health
           conformance/run.sh http://127.0.0.1:8080
+
+  container:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container image
+        run: docker build --platform ${{ matrix.platform }} -f Containerfile -t collie-whistle .
+      - name: Smoke test container
+        env:
+          WHISTLE_TOKEN: ci-smoke-token
+        run: |
+          container=$(docker run -d -e WHISTLE_TOKEN -p 127.0.0.1::8080 collie-whistle)
+          trap 'docker logs "$container"; docker rm -f "$container" >/dev/null' EXIT
+          base="http://$(docker port "$container" 8080/tcp)"
+          for _ in $(seq 50); do
+            curl -fs --max-time 2 "$base/v1/health" >/dev/null && break
+            sleep 0.2
+          done
+
+          check_status() {
+            expected=$1
+            shift
+            actual=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "$@")
+            echo "Expected HTTP $expected, got $actual"
+            test "$actual" = "$expected"
+          }
+          check_status 200 "$base/v1/health"
+          check_status 403 "$base/smoke/json?poll=1"
+          check_status 200 "$base/smoke/json?poll=1" -H "Authorization: Bearer $WHISTLE_TOKEN"
